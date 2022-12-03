@@ -1,6 +1,8 @@
 use std::{
+    ffi::OsString,
     io,
     marker::PhantomData,
+    mem::{self, ManuallyDrop},
     pin::Pin,
     task::{Context, Poll},
 };
@@ -9,17 +11,46 @@ use bincode::Options;
 use futures::{
     io::{AsyncRead, AsyncWrite},
     stream::Stream,
-    Sink,
+    AsyncWriteExt, Sink,
 };
 use interprocess::local_socket::{
-    tokio::{LocalSocketStream, OwnedReadHalf, OwnedWriteHalf},
+    tokio::{LocalSocketListener, LocalSocketStream, OwnedReadHalf, OwnedWriteHalf},
     ToLocalSocketName,
 };
 use serde::{de::DeserializeOwned, Serialize};
 
+#[cfg(test)]
+mod tests;
+
 const U16_MARKER: u8 = 252;
 const U32_MARKER: u8 = 253;
 const U64_MARKER: u8 = 254;
+const ZST_MARKER: u8 = 255;
+
+#[derive(Debug)]
+pub struct LocalSocketListenerTyped<T> {
+    raw: LocalSocketListener,
+    _phantom: PhantomData<T>,
+}
+
+impl<T> LocalSocketListenerTyped<T> {
+    pub fn bind<'a>(name: impl ToLocalSocketName<'a>) -> io::Result<Self> {
+        LocalSocketListener::bind(name).map(|raw| LocalSocketListenerTyped {
+            raw,
+            _phantom: PhantomData,
+        })
+    }
+
+    pub async fn accept(&self) -> io::Result<LocalSocketStreamTyped<T>> {
+        self.raw.accept().await.map(|raw| {
+            let (read, write) = raw.into_split();
+            LocalSocketStreamTyped {
+                read: OwnedReadHalfTyped::<T>::new(read),
+                write: OwnedWriteHalfTyped::<T>::new(write),
+            }
+        })
+    }
+}
 
 #[derive(Debug)]
 pub struct LocalSocketStreamTyped<T> {
@@ -96,13 +127,24 @@ fn bincode_options() -> impl Options {
 #[derive(Debug)]
 pub struct OwnedReadHalfTyped<T> {
     raw: OwnedReadHalf,
-    current_item_len: Option<u64>,
-    current_item_buffer: Vec<u8>,
-    len_read_mode: Option<LenReadMode>,
-    len_in_progress: [u8; 8],
-    len_in_progress_assigned: u8,
-    len_read: u64,
+    state: ReadHalfState,
     _phantom: PhantomData<T>,
+}
+
+#[derive(Debug)]
+enum ReadHalfState {
+    Idle,
+    ReadingLen {
+        len_read_mode: LenReadMode,
+        len_in_progress: [u8; 8],
+        len_in_progress_assigned: u8,
+    },
+    ReadingItem {
+        current_item_len: usize,
+        len_read: usize,
+        current_item_buffer: Box<[u8]>,
+    },
+    Finished,
 }
 
 impl<T: DeserializeOwned + Unpin> Stream for OwnedReadHalfTyped<T> {
@@ -111,56 +153,78 @@ impl<T: DeserializeOwned + Unpin> Stream for OwnedReadHalfTyped<T> {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let Self {
             ref mut raw,
-            ref mut current_item_len,
-            ref mut current_item_buffer,
-            len_read_mode,
-            len_in_progress,
-            len_in_progress_assigned,
-            len_read,
+            ref mut state,
             _phantom,
         } = &mut *self;
-        if let Some(current_item_len_inner) = current_item_len {
-            while *len_read < *current_item_len_inner {
-                match Pin::new(&mut *raw).poll_read(cx, current_item_buffer) {
-                    Poll::Ready(Ok(len)) => {
-                        if len == 0 {
-                            return Poll::Ready(None);
+        match state {
+            ReadHalfState::Idle => {
+                let mut buf = [0];
+                match Pin::new(raw).poll_read(cx, &mut buf) {
+                    Poll::Ready(Ok(_len)) => {
+                        match buf[0] {
+                            U16_MARKER => {
+                                *state = ReadHalfState::ReadingLen {
+                                    len_read_mode: LenReadMode::U16,
+                                    len_in_progress: Default::default(),
+                                    len_in_progress_assigned: 0,
+                                };
+                            }
+                            U32_MARKER => {
+                                *state = ReadHalfState::ReadingLen {
+                                    len_read_mode: LenReadMode::U32,
+                                    len_in_progress: Default::default(),
+                                    len_in_progress_assigned: 0,
+                                };
+                            }
+                            U64_MARKER => {
+                                *state = ReadHalfState::ReadingLen {
+                                    len_read_mode: LenReadMode::U64,
+                                    len_in_progress: Default::default(),
+                                    len_in_progress_assigned: 0,
+                                };
+                            }
+                            ZST_MARKER => {
+                                return Poll::Ready(Some(
+                                    bincode_options().deserialize(&[]).map_err(Error::Bincode),
+                                ));
+                            }
+                            0 => {
+                                *state = ReadHalfState::Finished;
+                                return Poll::Ready(None);
+                            }
+                            other => {
+                                *state = ReadHalfState::ReadingItem {
+                                    current_item_len: other as usize,
+                                    current_item_buffer: vec![0; other as usize].into_boxed_slice(),
+                                    len_read: 0,
+                                };
+                            }
                         }
-                        *len_read += len as u64;
-                        if *len_read == *current_item_len_inner {
-                            *len_read = 0;
-                            *current_item_len = None;
-                            break;
-                        }
+                        self.poll_next(cx)
                     }
-                    Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(Error::Io(e)))),
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(e)) => Poll::Ready(Some(Err(Error::Io(e)))),
+                    Poll::Pending => Poll::Pending,
                 }
             }
-
-            Poll::Ready(Some(
-                bincode_options()
-                    .deserialize(current_item_buffer)
-                    .map_err(Error::Bincode),
-            ))
-        } else if let Some(len_read_mode_inner) = len_read_mode {
-            loop {
+            ReadHalfState::ReadingLen {
+                ref mut len_read_mode,
+                ref mut len_in_progress,
+                ref mut len_in_progress_assigned,
+            } => loop {
                 let mut buf = [0; 8];
                 let accumulated = *len_in_progress_assigned as usize;
-                let slice = match len_read_mode_inner {
+                let slice = match len_read_mode {
                     LenReadMode::U16 => &mut buf[0..(2 - accumulated)],
                     LenReadMode::U32 => &mut buf[0..(4 - accumulated)],
                     LenReadMode::U64 => &mut buf[0..(8 - accumulated)],
                 };
                 match Pin::new(&mut *raw).poll_read(cx, slice) {
                     Poll::Ready(Ok(len)) => {
-                        if len == 0 {
-                            return Poll::Ready(None);
-                        }
-                        len_in_progress[accumulated..].copy_from_slice(slice);
+                        len_in_progress[accumulated..(accumulated + slice.len())]
+                            .copy_from_slice(&slice[..len]);
                         *len_in_progress_assigned += len as u8;
                         if len == slice.len() {
-                            *current_item_len = Some(match len_read_mode_inner {
+                            let new_len = match len_read_mode {
                                 LenReadMode::U16 => u16::from_le_bytes(
                                     (&len_in_progress[0..2]).try_into().expect("infallible"),
                                 ) as u64,
@@ -168,43 +232,45 @@ impl<T: DeserializeOwned + Unpin> Stream for OwnedReadHalfTyped<T> {
                                     (&len_in_progress[0..4]).try_into().expect("infallible"),
                                 ) as u64,
                                 LenReadMode::U64 => u64::from_le_bytes(*len_in_progress),
-                            });
-                            *len_read_mode = None;
-                            *len_in_progress_assigned = 0;
+                            };
+                            *state = ReadHalfState::ReadingItem {
+                                len_read: 0,
+                                current_item_len: new_len as usize,
+                                current_item_buffer: vec![0; new_len as usize].into_boxed_slice(),
+                            };
                             return self.poll_next(cx);
                         }
                     }
                     Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(Error::Io(e)))),
                     Poll::Pending => return Poll::Pending,
                 }
-            }
-        } else {
-            let mut buf = [0];
-            match Pin::new(&mut self.raw).poll_read(cx, &mut buf) {
-                Poll::Ready(Ok(len)) => {
-                    if len == 0 {
-                        Poll::Ready(None)
-                    } else {
-                        match buf[0] {
-                            U16_MARKER => {
-                                self.len_read_mode = Some(LenReadMode::U16);
-                            }
-                            U32_MARKER => {
-                                self.len_read_mode = Some(LenReadMode::U32);
-                            }
-                            U64_MARKER => {
-                                self.len_read_mode = Some(LenReadMode::U64);
-                            }
-                            other => {
-                                self.current_item_len = Some(other as u64);
+            },
+            ReadHalfState::ReadingItem {
+                ref mut len_read,
+                ref mut current_item_len,
+                ref mut current_item_buffer,
+            } => {
+                while *len_read < *current_item_len {
+                    match Pin::new(&mut *raw).poll_read(cx, current_item_buffer) {
+                        Poll::Ready(Ok(len)) => {
+                            *len_read += len as usize;
+                            if *len_read == *current_item_len {
+                                break;
                             }
                         }
-                        self.poll_next(cx)
+                        Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(Error::Io(e)))),
+                        Poll::Pending => return Poll::Pending,
                     }
                 }
-                Poll::Ready(Err(e)) => Poll::Ready(Some(Err(Error::Io(e)))),
-                Poll::Pending => Poll::Pending,
+                let ret = Poll::Ready(Some(
+                    bincode_options()
+                        .deserialize(current_item_buffer)
+                        .map_err(Error::Bincode),
+                ));
+                *state = ReadHalfState::Idle;
+                ret
             }
+            ReadHalfState::Finished => Poll::Ready(None),
         }
     }
 }
@@ -213,12 +279,7 @@ impl<T> OwnedReadHalfTyped<T> {
     fn new(raw: OwnedReadHalf) -> Self {
         Self {
             raw,
-            current_item_len: None,
-            current_item_buffer: Vec::new(),
-            len_read_mode: None,
-            len_in_progress: Default::default(),
-            len_in_progress_assigned: 0,
-            len_read: 0,
+            state: ReadHalfState::Idle,
             _phantom: PhantomData,
         }
     }
@@ -237,25 +298,42 @@ enum LenReadMode {
 
 #[derive(Debug)]
 pub struct OwnedWriteHalfTyped<T> {
-    raw: OwnedWriteHalf,
-    primed_value: Option<T>,
-    bytes_being_sent: Vec<u8>,
-    bytes_sent: usize,
-    current_len: [u8; 9],
-    len_to_be_sent: u8,
+    raw: ManuallyDrop<OwnedWriteHalf>,
+    state: WriteHalfState<T>,
+}
+
+#[derive(Debug)]
+enum WriteHalfState<T> {
+    Idle {
+        primed_value: Option<T>,
+    },
+    WritingLen {
+        bytes_being_sent: Vec<u8>,
+        current_len: [u8; 9],
+        len_to_be_sent: u8,
+    },
+    WritingValue {
+        bytes_being_sent: Vec<u8>,
+        bytes_sent: usize,
+    },
 }
 
 impl<T: Serialize + Unpin> Sink<T> for OwnedWriteHalfTyped<T> {
     type Error = Error;
 
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Pin::new(&mut self.raw)
+        Pin::new(&mut *self.raw)
             .poll_write(cx, &[])
             .map(|r| r.map(|_| ()).map_err(Error::Io))
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: T) -> Result<(), Self::Error> {
-        self.primed_value = Some(item);
+        if let WriteHalfState::Idle {
+            ref mut primed_value,
+        } = self.state
+        {
+            *primed_value = Some(item);
+        }
         Ok(())
     }
 
@@ -263,7 +341,7 @@ impl<T: Serialize + Unpin> Sink<T> for OwnedWriteHalfTyped<T> {
         match self.as_mut().maybe_send(cx) {
             Poll::Ready(Ok(Some(()))) => {
                 // Send successful, poll_flush now
-                Pin::new(&mut self.raw)
+                Pin::new(&mut *self.raw)
                     .poll_flush(cx)
                     .map(|r| r.map_err(Error::Io))
             }
@@ -277,7 +355,7 @@ impl<T: Serialize + Unpin> Sink<T> for OwnedWriteHalfTyped<T> {
         match self.as_mut().maybe_send(cx) {
             Poll::Ready(Ok(Some(()))) => {
                 // Send successful, poll_close now
-                Pin::new(&mut self.raw)
+                Pin::new(&mut *self.raw)
                     .poll_close(cx)
                     .map(|r| r.map_err(Error::Io))
             }
@@ -294,102 +372,115 @@ impl<T: Serialize + Unpin> OwnedWriteHalfTyped<T> {
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<()>, Error>> {
         let Self {
-            raw,
-            primed_value,
-            bytes_being_sent,
-            bytes_sent,
-            current_len,
-            len_to_be_sent,
+            ref mut raw,
+            ref mut state,
         } = &mut *self;
-        if let Some(item) = primed_value.take() {
-            let to_send = bincode_options().serialize(&item).map_err(Error::Bincode)?;
-            let (new_current_len, to_be_sent) = if to_send.len() < U16_MARKER as usize {
-                let bytes = (to_send.len() as u8).to_le_bytes();
-                ([bytes[0], 0, 0, 0, 0, 0, 0, 0, 0], 1)
-            } else if (to_send.len() as u64) < 2_u64.pow(16) {
-                let bytes = (to_send.len() as u16).to_le_bytes();
-                ([U16_MARKER, bytes[0], bytes[1], 0, 0, 0, 0, 0, 0], 3)
-            } else if (to_send.len() as u64) < 2_u64.pow(32) {
-                let bytes = (to_send.len() as u32).to_le_bytes();
-                (
-                    [
-                        U32_MARKER, bytes[0], bytes[1], bytes[2], bytes[3], 0, 0, 0, 0,
-                    ],
-                    5,
-                )
-            } else {
-                let bytes = (to_send.len() as u64).to_le_bytes();
-                (
-                    [
-                        U64_MARKER, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
-                        bytes[6], bytes[7],
-                    ],
-                    9,
-                )
-            };
-            *bytes_sent = 0;
-            match Pin::new(&mut *raw).poll_write(cx, &current_len[0..to_be_sent]) {
-                Poll::Ready(Ok(len)) => {
-                    if len == 0 {
-                        Poll::Ready(Ok(None))
-                    } else if len == to_be_sent {
-                        *bytes_being_sent = to_send;
-                        *len_to_be_sent = 0;
-                        self.maybe_send(cx)
+        match state {
+            WriteHalfState::Idle { primed_value } => {
+                if let Some(item) = primed_value.take() {
+                    let to_send = bincode_options().serialize(&item).map_err(Error::Bincode)?;
+                    let (new_current_len, to_be_sent) = if to_send.is_empty() {
+                        ([ZST_MARKER, 0, 0, 0, 0, 0, 0, 0, 0], 1)
+                    } else if to_send.len() < U16_MARKER as usize {
+                        let bytes = (to_send.len() as u8).to_le_bytes();
+                        ([bytes[0], 0, 0, 0, 0, 0, 0, 0, 0], 1)
+                    } else if (to_send.len() as u64) < 2_u64.pow(16) {
+                        let bytes = (to_send.len() as u16).to_le_bytes();
+                        ([U16_MARKER, bytes[0], bytes[1], 0, 0, 0, 0, 0, 0], 3)
+                    } else if (to_send.len() as u64) < 2_u64.pow(32) {
+                        let bytes = (to_send.len() as u32).to_le_bytes();
+                        (
+                            [
+                                U32_MARKER, bytes[0], bytes[1], bytes[2], bytes[3], 0, 0, 0, 0,
+                            ],
+                            5,
+                        )
                     } else {
-                        *bytes_being_sent = to_send;
-                        *current_len = new_current_len;
-                        *len_to_be_sent = (to_be_sent - len) as u8;
-                        self.maybe_send(cx)
+                        let bytes = (to_send.len() as u64).to_le_bytes();
+                        (
+                            [
+                                U64_MARKER, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4],
+                                bytes[5], bytes[6], bytes[7],
+                            ],
+                            9,
+                        )
+                    };
+                    match Pin::new(&mut **raw).poll_write(cx, &new_current_len[0..to_be_sent]) {
+                        Poll::Ready(Ok(len)) => {
+                            if len == to_be_sent {
+                                *state = WriteHalfState::WritingValue {
+                                    bytes_being_sent: to_send,
+                                    bytes_sent: 0,
+                                };
+                                self.maybe_send(cx)
+                            } else {
+                                *state = WriteHalfState::WritingLen {
+                                    current_len: new_current_len,
+                                    len_to_be_sent: (to_be_sent - len) as u8,
+                                    bytes_being_sent: to_send,
+                                };
+                                self.maybe_send(cx)
+                            }
+                        }
+                        Poll::Ready(Err(e)) => Poll::Ready(Err(Error::Io(e))),
+                        Poll::Pending => {
+                            *state = WriteHalfState::WritingLen {
+                                current_len: new_current_len,
+                                len_to_be_sent: to_be_sent as u8,
+                                bytes_being_sent: to_send,
+                            };
+                            Poll::Pending
+                        }
                     }
-                }
-                Poll::Ready(Err(e)) => Poll::Ready(Err(Error::Io(e))),
-                Poll::Pending => {
-                    *current_len = new_current_len;
-                    *len_to_be_sent = to_be_sent as u8;
-                    *bytes_being_sent = to_send;
+                } else {
                     Poll::Pending
                 }
             }
-        } else if *len_to_be_sent > 0 {
-            match Pin::new(&mut *raw).poll_write(cx, &current_len[0..(*len_to_be_sent as usize)]) {
-                Poll::Ready(Ok(len)) => {
-                    if len == 0 {
-                        Poll::Ready(Ok(None))
-                    } else if len == *len_to_be_sent as usize {
-                        *len_to_be_sent = 0;
-                        self.maybe_send(cx)
-                    } else {
-                        *len_to_be_sent -= len as u8;
-                        self.maybe_send(cx)
+            WriteHalfState::WritingLen {
+                current_len,
+                len_to_be_sent,
+                bytes_being_sent,
+            } => {
+                match Pin::new(&mut **raw)
+                    .poll_write(cx, &current_len[0..(*len_to_be_sent as usize)])
+                {
+                    Poll::Ready(Ok(len)) => {
+                        if len == *len_to_be_sent as usize {
+                            *state = WriteHalfState::WritingValue {
+                                bytes_being_sent: mem::take(bytes_being_sent),
+                                bytes_sent: 0,
+                            };
+                            self.maybe_send(cx)
+                        } else {
+                            *len_to_be_sent -= len as u8;
+                            self.maybe_send(cx)
+                        }
                     }
+                    Poll::Ready(Err(e)) => Poll::Ready(Err(Error::Io(e))),
+                    Poll::Pending => Poll::Pending,
                 }
-                Poll::Ready(Err(e)) => Poll::Ready(Err(Error::Io(e))),
-                Poll::Pending => Poll::Pending,
             }
-        } else {
-            loop {
+            WriteHalfState::WritingValue {
+                bytes_being_sent,
+                bytes_sent,
+            } => loop {
                 if *bytes_sent < bytes_being_sent.len() {
-                    match Pin::new(&mut *raw).poll_write(cx, &bytes_being_sent[*bytes_sent..]) {
+                    match Pin::new(&mut **raw).poll_write(cx, &bytes_being_sent[*bytes_sent..]) {
                         Poll::Ready(Ok(len)) => {
-                            if len == 0 {
-                                return Poll::Ready(Ok(None));
-                            } else {
-                                *bytes_sent += len;
-                                if *bytes_sent == bytes_being_sent.len() {
-                                    *bytes_sent = 0;
-                                    bytes_being_sent.clear();
-                                    return Poll::Ready(Ok(Some(())));
-                                }
+                            *bytes_sent += len;
+                            if *bytes_sent == bytes_being_sent.len() {
+                                *state = WriteHalfState::Idle { primed_value: None };
+                                return Poll::Ready(Ok(Some(())));
                             }
                         }
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(Error::Io(e))),
                         Poll::Pending => return Poll::Pending,
                     }
                 } else {
+                    *state = WriteHalfState::Idle { primed_value: None };
                     return Poll::Ready(Ok(Some(())));
                 }
-            }
+            },
         }
     }
 }
@@ -397,16 +488,35 @@ impl<T: Serialize + Unpin> OwnedWriteHalfTyped<T> {
 impl<T> OwnedWriteHalfTyped<T> {
     fn new(raw: OwnedWriteHalf) -> Self {
         Self {
-            raw,
-            primed_value: None,
-            bytes_being_sent: Vec::new(),
-            bytes_sent: 0,
-            current_len: Default::default(),
-            len_to_be_sent: 0,
+            raw: ManuallyDrop::new(raw),
+            state: WriteHalfState::Idle { primed_value: None },
         }
     }
 
     pub fn peer_pid(&self) -> io::Result<u32> {
         self.raw.peer_pid()
+    }
+}
+
+impl<T> Drop for OwnedWriteHalfTyped<T> {
+    fn drop(&mut self) {
+        let mut raw = unsafe { ManuallyDrop::take(&mut self.raw) };
+        if let WriteHalfState::Idle { .. } = self.state {
+            tokio::spawn(async move {
+                let _ = raw.write_all(&[0]).await;
+            });
+        }
+    }
+}
+
+pub fn generate_socket_name() -> io::Result<OsString> {
+    #[cfg(windows)]
+    {
+        OsString::from(format!("\\\\.\\pipe\\{}", uuid::new_v4()))
+    }
+    #[cfg(not(windows))]
+    {
+        let path = tempfile::tempdir()?.into_path().join("ipc_socket");
+        Ok(path.into_os_string())
     }
 }
