@@ -251,9 +251,9 @@ impl<T: DeserializeOwned + Unpin> Stream for OwnedReadHalfTyped<T> {
                 ref mut current_item_buffer,
             } => {
                 while *len_read < *current_item_len {
-                    match Pin::new(&mut *raw).poll_read(cx, current_item_buffer) {
+                    match Pin::new(&mut *raw).poll_read(cx, &mut current_item_buffer[*len_read..]) {
                         Poll::Ready(Ok(len)) => {
-                            *len_read += len as usize;
+                            *len_read += len;
                             if *len_read == *current_item_len {
                                 break;
                             }
