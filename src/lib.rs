@@ -426,7 +426,7 @@ impl<T: Serialize + Unpin> OwnedWriteHalfTyped<T> {
                         }
                     }
                 } else {
-                    Poll::Pending
+                    Poll::Ready(Ok(Some(())))
                 }
             }
             WriteHalfState::WritingLen {
