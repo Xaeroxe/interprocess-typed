@@ -181,7 +181,7 @@ async fn random_len_test() {
     let mut client_stream = client_stream.await.unwrap().unwrap();
     for _ in 0..800 {
         let message =
-            (0..(rand::thread_rng().gen_range(0..(u16::MAX as u32 + 1) / 4))).collect::<Vec<_>>();
+            (0..(rand::thread_rng().gen_range(0..(u8::MAX as u32 + 1) / 4))).collect::<Vec<_>>();
         let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
         assert_eq!(client_stream.next().await.unwrap().unwrap(), message);
         server_stream = Some(fut.await.unwrap());
