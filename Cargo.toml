@@ -14,7 +14,7 @@ thiserror = "1.0.37"
 tokio = { version = "1.22.0", features = ["rt", "io-util", "macros", "sync"] }
 
 [target.'cfg(windows)'.dependencies]
-uuid = "1.2"
+uuid = { version = "1.2", features = ["v4"] }
 
 [target.'cfg(not(windows))'.dependencies]
 tempfile = "3.3.0"
