@@ -512,7 +512,7 @@ impl<T> Drop for OwnedWriteHalfTyped<T> {
 pub fn generate_socket_name() -> io::Result<OsString> {
     #[cfg(windows)]
     {
-        OsString::from(format!("\\\\.\\pipe\\{}", uuid::new_v4()))
+        Ok(OsString::from(format!("\\\\.\\pipe\\{}", uuid::new_v4())))
     }
     #[cfg(not(windows))]
     {
