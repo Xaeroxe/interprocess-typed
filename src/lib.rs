@@ -512,7 +512,7 @@ impl<T> Drop for OwnedWriteHalfTyped<T> {
 pub fn generate_socket_name() -> io::Result<OsString> {
     #[cfg(windows)]
     {
-        Ok(OsString::from(format!("{}", uuid::Uuid::new_v4())))
+        Ok(OsString::from(format!("@{}.sock", uuid::Uuid::new_v4())))
     }
     #[cfg(not(windows))]
     {
