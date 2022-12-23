@@ -109,6 +109,7 @@ async fn u16_len_messages() {
     }
 }
 
+#[ignore]
 #[tokio::test]
 async fn u32_len_message() {
     let socket_name = generate_socket_name().unwrap();
@@ -122,6 +123,7 @@ async fn u32_len_message() {
     fut.await.unwrap();
 }
 
+#[ignore]
 #[tokio::test]
 async fn u32_len_messages() {
     let socket_name = generate_socket_name().unwrap();
