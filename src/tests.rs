@@ -6,10 +6,10 @@ use super::*;
 fn start_send_helper<T: Serialize + Unpin + Send + 'static>(
     mut s: LocalSocketStreamTyped<T>,
     value: T,
-) -> JoinHandle<LocalSocketStreamTyped<T>> {
+) -> JoinHandle<(LocalSocketStreamTyped<T>, Result<(), Error>)> {
     tokio::spawn(async move {
-        s.send(value).await.unwrap();
-        s
+        let ret = s.send(value).await;
+        (s, ret)
     })
 }
 
@@ -23,7 +23,7 @@ async fn hello_world() {
     let message = "Hello, world!".as_bytes().to_vec();
     let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
     assert_eq!(client_stream.next().await.unwrap().unwrap(), message);
-    fut.await.unwrap();
+    fut.await.unwrap().1.unwrap();
 }
 
 #[tokio::test]
@@ -36,7 +36,7 @@ async fn shutdown_after_hello_world() {
     let message = "Hello, world!".as_bytes().to_vec();
     let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
     assert_eq!(client_stream.next().await.unwrap().unwrap(), message);
-    fut.await.unwrap();
+    fut.await.unwrap().1.unwrap();
     assert!(client_stream.next().await.is_none());
 }
 
@@ -51,7 +51,9 @@ async fn hello_worlds() {
         let message = format!("Hello, world {}!", i).into_bytes();
         let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
         assert_eq!(client_stream.next().await.unwrap().unwrap(), message);
-        server_stream = Some(fut.await.unwrap());
+        let (stream, result) = fut.await.unwrap();
+        server_stream = Some(stream);
+        result.unwrap();
     }
 }
 
@@ -64,7 +66,7 @@ async fn zero_len_message() {
     let mut client_stream = client_stream.await.unwrap().unwrap();
     let fut = start_send_helper(server_stream.take().unwrap(), ());
     client_stream.next().await.unwrap().unwrap();
-    fut.await.unwrap();
+    fut.await.unwrap().1.unwrap();
 }
 
 #[tokio::test]
@@ -77,7 +79,9 @@ async fn zero_len_messages() {
     for _ in 0..100 {
         let fut = start_send_helper(server_stream.take().unwrap(), ());
         client_stream.next().await.unwrap().unwrap();
-        server_stream = Some(fut.await.unwrap());
+        let (stream, result) = fut.await.unwrap();
+        server_stream = Some(stream);
+        result.unwrap();
     }
 }
 
@@ -91,7 +95,7 @@ async fn u16_len_message() {
     let message = (0..(u8::MAX as u16 + 1) / 2).collect::<Vec<_>>();
     let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
     assert_eq!(client_stream.next().await.unwrap().unwrap(), message);
-    fut.await.unwrap();
+    fut.await.unwrap().1.unwrap();
 }
 
 #[tokio::test]
@@ -105,11 +109,12 @@ async fn u16_len_messages() {
         let message = (0..(u8::MAX as u16 + 1) / 2).collect::<Vec<_>>();
         let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
         assert_eq!(client_stream.next().await.unwrap().unwrap(), message);
-        server_stream = Some(fut.await.unwrap());
+        let (stream, result) = fut.await.unwrap();
+        server_stream = Some(stream);
+        result.unwrap();
     }
 }
 
-#[ignore]
 #[tokio::test]
 async fn u32_len_message() {
     let socket_name = generate_socket_name().unwrap();
@@ -120,10 +125,9 @@ async fn u32_len_message() {
     let message = (0..(u16::MAX as u32 + 1) / 4).collect::<Vec<_>>();
     let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
     assert_eq!(client_stream.next().await.unwrap().unwrap(), message);
-    fut.await.unwrap();
+    fut.await.unwrap().1.unwrap();
 }
 
-#[ignore]
 #[tokio::test]
 async fn u32_len_messages() {
     let socket_name = generate_socket_name().unwrap();
@@ -135,7 +139,9 @@ async fn u32_len_messages() {
         let message = (0..(u16::MAX as u32 + 1) / 4).collect::<Vec<_>>();
         let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
         assert_eq!(client_stream.next().await.unwrap().unwrap(), message);
-        server_stream = Some(fut.await.unwrap());
+        let (stream, result) = fut.await.unwrap();
+        server_stream = Some(stream);
+        result.unwrap();
     }
 }
 
@@ -166,7 +172,9 @@ async fn u64_len_messages() {
         let message = (0..(u32::MAX as u64 + 1) / 8).collect::<Vec<_>>();
         let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
         assert_eq!(client_stream.next().await.unwrap().unwrap(), message);
-        server_stream = Some(fut.await.unwrap());
+        let (stream, result) = fut.await.unwrap();
+        server_stream = Some(stream);
+        result.unwrap();
     }
 }
 
@@ -184,6 +192,8 @@ async fn random_len_test() {
             (0..(rand::thread_rng().gen_range(0..(u8::MAX as u32 + 1) / 4))).collect::<Vec<_>>();
         let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
         assert_eq!(client_stream.next().await.unwrap().unwrap(), message);
-        server_stream = Some(fut.await.unwrap());
+        let (stream, result) = fut.await.unwrap();
+        server_stream = Some(stream);
+        result.unwrap();
     }
 }
