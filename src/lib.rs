@@ -4,7 +4,7 @@ use std::{
     marker::PhantomData,
     mem::{self, ManuallyDrop},
     pin::Pin,
-    task::{Context, Poll},
+    task::{Context, Poll}, collections::VecDeque,
 };
 
 use bincode::Options;
@@ -299,14 +299,13 @@ enum LenReadMode {
 #[derive(Debug)]
 pub struct OwnedWriteHalfTyped<T> {
     raw: ManuallyDrop<OwnedWriteHalf>,
-    state: WriteHalfState<T>,
+    state: WriteHalfState,
+    primed_values: VecDeque<T>,
 }
 
 #[derive(Debug)]
-enum WriteHalfState<T> {
-    Idle {
-        primed_value: Option<T>,
-    },
+enum WriteHalfState {
+    Idle,
     WritingLen {
         bytes_being_sent: Vec<u8>,
         current_len: [u8; 9],
@@ -321,19 +320,12 @@ enum WriteHalfState<T> {
 impl<T: Serialize + Unpin> Sink<T> for OwnedWriteHalfTyped<T> {
     type Error = Error;
 
-    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Pin::new(&mut *self.raw)
-            .poll_write(cx, &[])
-            .map(|r| r.map(|_| ()).map_err(Error::Io))
+    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: T) -> Result<(), Self::Error> {
-        if let WriteHalfState::Idle {
-            ref mut primed_value,
-        } = self.state
-        {
-            *primed_value = Some(item);
-        }
+        self.primed_values.push_front(item);
         Ok(())
     }
 
@@ -374,10 +366,11 @@ impl<T: Serialize + Unpin> OwnedWriteHalfTyped<T> {
         let Self {
             ref mut raw,
             ref mut state,
+            ref mut primed_values,
         } = &mut *self;
         match state {
-            WriteHalfState::Idle { primed_value } => {
-                if let Some(item) = primed_value.take() {
+            WriteHalfState::Idle => {
+                if let Some(item) = primed_values.pop_back() {
                     let to_send = bincode_options().serialize(&item).map_err(Error::Bincode)?;
                     let (new_current_len, to_be_sent) = if to_send.is_empty() {
                         ([ZST_MARKER, 0, 0, 0, 0, 0, 0, 0, 0], 1)
@@ -469,7 +462,7 @@ impl<T: Serialize + Unpin> OwnedWriteHalfTyped<T> {
                         Poll::Ready(Ok(len)) => {
                             *bytes_sent += len;
                             if *bytes_sent == bytes_being_sent.len() {
-                                *state = WriteHalfState::Idle { primed_value: None };
+                                *state = WriteHalfState::Idle;
                                 return Poll::Ready(Ok(Some(())));
                             }
                         }
@@ -477,7 +470,7 @@ impl<T: Serialize + Unpin> OwnedWriteHalfTyped<T> {
                         Poll::Pending => return Poll::Pending,
                     }
                 } else {
-                    *state = WriteHalfState::Idle { primed_value: None };
+                    *state = WriteHalfState::Idle;
                     return Poll::Ready(Ok(Some(())));
                 }
             },
@@ -489,7 +482,8 @@ impl<T> OwnedWriteHalfTyped<T> {
     fn new(raw: OwnedWriteHalf) -> Self {
         Self {
             raw: ManuallyDrop::new(raw),
-            state: WriteHalfState::Idle { primed_value: None },
+            state: WriteHalfState::Idle,
+            primed_values: VecDeque::new(),
         }
     }
 
