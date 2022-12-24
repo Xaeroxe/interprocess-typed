@@ -159,6 +159,60 @@ async fn u32_len_messages() {
     }
 }
 
+#[tokio::test]
+async fn marker_len_messages() {
+    let bincode_config = || super::bincode_options(1024);
+    let bincode_length_size = 8;
+
+    // u16
+    let socket_name = generate_socket_name().unwrap();
+    let listener = LocalSocketListenerTyped::<Vec<u8>>::bind(socket_name.as_os_str()).unwrap();
+    let client_stream = tokio::spawn(LocalSocketStreamTyped::<Vec<u8>>::connect(socket_name));
+    let mut server_stream = Some(listener.accept().await.unwrap());
+    let mut client_stream = client_stream.await.unwrap().unwrap();
+    let message = (0..(252 - bincode_length_size)).collect::<Vec<_>>();
+    assert_eq!(bincode_config().serialize(&message).unwrap().len(), 252);
+    let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
+    assert_eq!(client_stream.next().await.unwrap().unwrap(), message);
+    fut.await.unwrap().1.unwrap();
+
+    // u32
+    let socket_name = generate_socket_name().unwrap();
+    let listener = LocalSocketListenerTyped::<Vec<u8>>::bind(socket_name.as_os_str()).unwrap();
+    let client_stream = tokio::spawn(LocalSocketStreamTyped::<Vec<u8>>::connect(socket_name));
+    let mut server_stream = Some(listener.accept().await.unwrap());
+    let mut client_stream = client_stream.await.unwrap().unwrap();
+    let message = (0..(253 - bincode_length_size)).collect::<Vec<_>>();
+    assert_eq!(bincode_config().serialize(&message).unwrap().len(), 253);
+    let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
+    assert_eq!(client_stream.next().await.unwrap().unwrap(), message);
+    fut.await.unwrap().1.unwrap();
+
+    // u64
+    let socket_name = generate_socket_name().unwrap();
+    let listener = LocalSocketListenerTyped::<Vec<u8>>::bind(socket_name.as_os_str()).unwrap();
+    let client_stream = tokio::spawn(LocalSocketStreamTyped::<Vec<u8>>::connect(socket_name));
+    let mut server_stream = Some(listener.accept().await.unwrap());
+    let mut client_stream = client_stream.await.unwrap().unwrap();
+    let message = (0..(254 - bincode_length_size)).collect::<Vec<_>>();
+    assert_eq!(bincode_config().serialize(&message).unwrap().len(), 254);
+    let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
+    assert_eq!(client_stream.next().await.unwrap().unwrap(), message);
+    fut.await.unwrap().1.unwrap();
+
+    // zst
+    let socket_name = generate_socket_name().unwrap();
+    let listener = LocalSocketListenerTyped::<Vec<u8>>::bind(socket_name.as_os_str()).unwrap();
+    let client_stream = tokio::spawn(LocalSocketStreamTyped::<Vec<u8>>::connect(socket_name));
+    let mut server_stream = Some(listener.accept().await.unwrap());
+    let mut client_stream = client_stream.await.unwrap().unwrap();
+    let message = (0..(255 - bincode_length_size)).collect::<Vec<_>>();
+    assert_eq!(bincode_config().serialize(&message).unwrap().len(), 255);
+    let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
+    assert_eq!(client_stream.next().await.unwrap().unwrap(), message);
+    fut.await.unwrap().1.unwrap();
+}
+
 // It takes a ridiculous amount of time to run the u64 tests
 #[ignore]
 #[tokio::test]
