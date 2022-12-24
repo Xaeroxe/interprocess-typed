@@ -55,7 +55,7 @@ message. Messages have no footer. The bytes read out of a message are then deser
 bincode::DefaultOptions::new()
     .with_limit(size_limit)
     .with_little_endian()
-    .with_fixint_encoding()
+    .with_varint_encoding()
     .reject_trailing_bytes()
 ```
 

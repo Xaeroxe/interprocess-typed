@@ -175,7 +175,7 @@ fn bincode_options(size_limit: u64) -> impl Options {
     bincode::DefaultOptions::new()
         .with_limit(size_limit)
         .with_little_endian()
-        .with_fixint_encoding()
+        .with_varint_encoding()
         .reject_trailing_bytes()
 }
 
