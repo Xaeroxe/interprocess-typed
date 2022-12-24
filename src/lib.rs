@@ -437,117 +437,118 @@ impl<T: Serialize + Unpin> OwnedWriteHalfTyped<T> {
             ref mut state,
             ref mut primed_values,
         } = &mut *self;
-        match state {
-            WriteHalfState::Idle => {
-                if let Some(item) = primed_values.pop_back() {
-                    let to_send = bincode_options(*size_limit)
-                        .serialize(&item)
-                        .map_err(Error::Bincode)?;
-                    if to_send.len() as u64 > *size_limit {
-                        return Poll::Ready(Err(Error::SentMessageTooLarge));
-                    }
-                    let (new_current_len, to_be_sent) = if to_send.is_empty() {
-                        ([ZST_MARKER, 0, 0, 0, 0, 0, 0, 0, 0], 1)
-                    } else if to_send.len() < U16_MARKER as usize {
-                        let bytes = (to_send.len() as u8).to_le_bytes();
-                        ([bytes[0], 0, 0, 0, 0, 0, 0, 0, 0], 1)
-                    } else if (to_send.len() as u64) < 2_u64.pow(16) {
-                        let bytes = (to_send.len() as u16).to_le_bytes();
-                        ([U16_MARKER, bytes[0], bytes[1], 0, 0, 0, 0, 0, 0], 3)
-                    } else if (to_send.len() as u64) < 2_u64.pow(32) {
-                        let bytes = (to_send.len() as u32).to_le_bytes();
-                        (
-                            [
-                                U32_MARKER, bytes[0], bytes[1], bytes[2], bytes[3], 0, 0, 0, 0,
-                            ],
-                            5,
-                        )
-                    } else {
-                        let bytes = (to_send.len() as u64).to_le_bytes();
-                        (
-                            [
-                                U64_MARKER, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4],
-                                bytes[5], bytes[6], bytes[7],
-                            ],
-                            9,
-                        )
-                    };
-                    match Pin::new(&mut **raw).poll_write(cx, &new_current_len[0..to_be_sent]) {
-                        Poll::Ready(Ok(len)) => {
-                            if len == to_be_sent {
-                                *state = WriteHalfState::WritingValue {
-                                    bytes_being_sent: to_send,
-                                    bytes_sent: 0,
-                                };
-                                self.maybe_send(cx)
-                            } else {
+        loop {
+            return match state {
+                WriteHalfState::Idle => {
+                    if let Some(item) = primed_values.pop_back() {
+                        let to_send = bincode_options(*size_limit)
+                            .serialize(&item)
+                            .map_err(Error::Bincode)?;
+                        if to_send.len() as u64 > *size_limit {
+                            return Poll::Ready(Err(Error::SentMessageTooLarge));
+                        }
+                        let (new_current_len, to_be_sent) = if to_send.is_empty() {
+                            ([ZST_MARKER, 0, 0, 0, 0, 0, 0, 0, 0], 1)
+                        } else if to_send.len() < U16_MARKER as usize {
+                            let bytes = (to_send.len() as u8).to_le_bytes();
+                            ([bytes[0], 0, 0, 0, 0, 0, 0, 0, 0], 1)
+                        } else if (to_send.len() as u64) < 2_u64.pow(16) {
+                            let bytes = (to_send.len() as u16).to_le_bytes();
+                            ([U16_MARKER, bytes[0], bytes[1], 0, 0, 0, 0, 0, 0], 3)
+                        } else if (to_send.len() as u64) < 2_u64.pow(32) {
+                            let bytes = (to_send.len() as u32).to_le_bytes();
+                            (
+                                [
+                                    U32_MARKER, bytes[0], bytes[1], bytes[2], bytes[3], 0, 0, 0, 0,
+                                ],
+                                5,
+                            )
+                        } else {
+                            let bytes = (to_send.len() as u64).to_le_bytes();
+                            (
+                                [
+                                    U64_MARKER, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4],
+                                    bytes[5], bytes[6], bytes[7],
+                                ],
+                                9,
+                            )
+                        };
+                        match Pin::new(&mut **raw).poll_write(cx, &new_current_len[0..to_be_sent]) {
+                            Poll::Ready(Ok(len)) => {
+                                if len == to_be_sent {
+                                    *state = WriteHalfState::WritingValue {
+                                        bytes_being_sent: to_send,
+                                        bytes_sent: 0,
+                                    };
+                                    continue;
+                                } else {
+                                    *state = WriteHalfState::WritingLen {
+                                        current_len: new_current_len,
+                                        len_to_be_sent: (to_be_sent - len) as u8,
+                                        bytes_being_sent: to_send,
+                                    };
+                                    continue;
+                                }
+                            }
+                            Poll::Ready(Err(e)) => Poll::Ready(Err(Error::Io(e))),
+                            Poll::Pending => {
                                 *state = WriteHalfState::WritingLen {
                                     current_len: new_current_len,
-                                    len_to_be_sent: (to_be_sent - len) as u8,
+                                    len_to_be_sent: to_be_sent as u8,
                                     bytes_being_sent: to_send,
                                 };
-                                self.maybe_send(cx)
+                                Poll::Pending
+                            }
+                        }
+                    } else {
+                        Poll::Ready(Ok(Some(())))
+                    }
+                }
+                WriteHalfState::WritingLen {
+                    current_len,
+                    len_to_be_sent,
+                    bytes_being_sent,
+                } => {
+                    match Pin::new(&mut **raw)
+                        .poll_write(cx, &current_len[0..(*len_to_be_sent as usize)])
+                    {
+                        Poll::Ready(Ok(len)) => {
+                            if len == *len_to_be_sent as usize {
+                                *state = WriteHalfState::WritingValue {
+                                    bytes_being_sent: mem::take(bytes_being_sent),
+                                    bytes_sent: 0,
+                                };
+                                continue;
+                            } else {
+                                *len_to_be_sent -= len as u8;
+                                continue;
                             }
                         }
                         Poll::Ready(Err(e)) => Poll::Ready(Err(Error::Io(e))),
-                        Poll::Pending => {
-                            *state = WriteHalfState::WritingLen {
-                                current_len: new_current_len,
-                                len_to_be_sent: to_be_sent as u8,
-                                bytes_being_sent: to_send,
-                            };
-                            Poll::Pending
-                        }
+                        Poll::Pending => Poll::Pending,
                     }
-                } else {
-                    Poll::Ready(Ok(Some(())))
                 }
-            }
-            WriteHalfState::WritingLen {
-                current_len,
-                len_to_be_sent,
-                bytes_being_sent,
-            } => {
-                match Pin::new(&mut **raw)
-                    .poll_write(cx, &current_len[0..(*len_to_be_sent as usize)])
-                {
+                WriteHalfState::WritingValue {
+                    bytes_being_sent,
+                    bytes_sent,
+                } => match Pin::new(&mut **raw).poll_write(cx, &bytes_being_sent[*bytes_sent..]) {
                     Poll::Ready(Ok(len)) => {
-                        if len == *len_to_be_sent as usize {
-                            *state = WriteHalfState::WritingValue {
-                                bytes_being_sent: mem::take(bytes_being_sent),
-                                bytes_sent: 0,
+                        *bytes_sent += len;
+                        if *bytes_sent == bytes_being_sent.len() {
+                            *state = WriteHalfState::Idle;
+                            return if primed_values.is_empty() {
+                                Poll::Ready(Ok(Some(())))
+                            } else {
+                                continue;
                             };
-                            self.maybe_send(cx)
                         } else {
-                            *len_to_be_sent -= len as u8;
-                            self.maybe_send(cx)
+                            continue;
                         }
                     }
-                    Poll::Ready(Err(e)) => Poll::Ready(Err(Error::Io(e))),
-                    Poll::Pending => Poll::Pending,
-                }
-            }
-            WriteHalfState::WritingValue {
-                bytes_being_sent,
-                bytes_sent,
-            } => loop {
-                if *bytes_sent < bytes_being_sent.len() {
-                    match Pin::new(&mut **raw).poll_write(cx, &bytes_being_sent[*bytes_sent..]) {
-                        Poll::Ready(Ok(len)) => {
-                            *bytes_sent += len;
-                            if *bytes_sent == bytes_being_sent.len() {
-                                *state = WriteHalfState::Idle;
-                                return Poll::Ready(Ok(Some(())));
-                            }
-                        }
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(Error::Io(e))),
-                        Poll::Pending => return Poll::Pending,
-                    }
-                } else {
-                    *state = WriteHalfState::Idle;
-                    return Poll::Ready(Ok(Some(())));
-                }
-            },
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(Error::Io(e))),
+                    Poll::Pending => return Poll::Pending,
+                },
+            };
         }
     }
 }
