@@ -536,11 +536,11 @@ impl<T: Serialize + Unpin> OwnedWriteHalfTyped<T> {
                         *bytes_sent += len;
                         if *bytes_sent == bytes_being_sent.len() {
                             *state = WriteHalfState::Idle;
-                            return if primed_values.is_empty() {
+                            if primed_values.is_empty() {
                                 Poll::Ready(Ok(Some(())))
                             } else {
                                 continue;
-                            };
+                            }
                         } else {
                             continue;
                         }
