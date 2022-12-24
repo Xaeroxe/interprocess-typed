@@ -1,10 +1,11 @@
 use std::{
+    collections::VecDeque,
     ffi::OsString,
     io,
     marker::PhantomData,
     mem::{self, ManuallyDrop},
     pin::Pin,
-    task::{Context, Poll}, collections::VecDeque,
+    task::{Context, Poll},
 };
 
 use bincode::Options;
@@ -41,14 +42,25 @@ impl<T> LocalSocketListenerTyped<T> {
         })
     }
 
-    pub async fn accept(&self) -> io::Result<LocalSocketStreamTyped<T>> {
+    /// Accepts the connection, initializing it with the given size limit specified in bytes.
+    ///
+    /// Be careful, large limits might create a vulnerability to a Denial of Service attack.
+    pub async fn accept_with_limit(
+        &self,
+        size_limit: u64,
+    ) -> io::Result<LocalSocketStreamTyped<T>> {
         self.raw.accept().await.map(|raw| {
             let (read, write) = raw.into_split();
             LocalSocketStreamTyped {
-                read: OwnedReadHalfTyped::<T>::new(read),
-                write: OwnedWriteHalfTyped::<T>::new(write),
+                read: OwnedReadHalfTyped::<T>::new(read, size_limit),
+                write: OwnedWriteHalfTyped::<T>::new(write, size_limit),
             }
         })
+    }
+
+    /// Accepts the connection, initializing it with a default size limit of 1 MB per message.
+    pub async fn accept(&self) -> io::Result<LocalSocketStreamTyped<T>> {
+        self.accept_with_limit(1024_u64.pow(2)).await
     }
 }
 
@@ -59,14 +71,25 @@ pub struct LocalSocketStreamTyped<T> {
 }
 
 impl<T> LocalSocketStreamTyped<T> {
-    pub async fn connect<'a>(name: impl ToLocalSocketName<'a>) -> io::Result<Self> {
+    /// Creates a connection, initializing it with the given size limit specified in bytes.
+    ///
+    /// Be careful, large limits might create a vulnerability to a Denial of Service attack.
+    pub async fn connect_with_limit<'a>(
+        name: impl ToLocalSocketName<'a>,
+        size_limit: u64,
+    ) -> io::Result<Self> {
         LocalSocketStream::connect(name).await.map(|raw| {
             let (read, write) = raw.into_split();
             Self {
-                read: OwnedReadHalfTyped::new(read),
-                write: OwnedWriteHalfTyped::new(write),
+                read: OwnedReadHalfTyped::new(read, size_limit),
+                write: OwnedWriteHalfTyped::new(write, size_limit),
             }
         })
+    }
+
+    /// Creates a connection, initializing it with a default size limit of 1 MB per message.
+    pub async fn connect<'a>(name: impl ToLocalSocketName<'a>) -> io::Result<Self> {
+        Self::connect_with_limit(name, 1024_u64.pow(2)).await
     }
 
     pub fn into_split(self) -> (OwnedReadHalfTyped<T>, OwnedWriteHalfTyped<T>) {
@@ -114,11 +137,11 @@ pub enum Error {
     Bincode(bincode::Error),
 }
 
-fn bincode_options() -> impl Options {
+fn bincode_options(size_limit: u64) -> impl Options {
     // Two of these are defaults, so you might say this is over specified. I say it's future proof, as
     // bincode default changes won't introduce accidental breaking changes.
     bincode::DefaultOptions::new()
-        .with_limit(1024_u64.pow(2))
+        .with_limit(size_limit)
         .with_little_endian()
         .with_fixint_encoding()
         .reject_trailing_bytes()
@@ -127,6 +150,7 @@ fn bincode_options() -> impl Options {
 #[derive(Debug)]
 pub struct OwnedReadHalfTyped<T> {
     raw: OwnedReadHalf,
+    size_limit: u64,
     state: ReadHalfState,
     _phantom: PhantomData<T>,
 }
@@ -153,6 +177,7 @@ impl<T: DeserializeOwned + Unpin> Stream for OwnedReadHalfTyped<T> {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let Self {
             ref mut raw,
+            ref size_limit,
             ref mut state,
             _phantom,
         } = &mut *self;
@@ -185,7 +210,9 @@ impl<T: DeserializeOwned + Unpin> Stream for OwnedReadHalfTyped<T> {
                             }
                             ZST_MARKER => {
                                 return Poll::Ready(Some(
-                                    bincode_options().deserialize(&[]).map_err(Error::Bincode),
+                                    bincode_options(*size_limit)
+                                        .deserialize(&[])
+                                        .map_err(Error::Bincode),
                                 ));
                             }
                             0 => {
@@ -263,7 +290,7 @@ impl<T: DeserializeOwned + Unpin> Stream for OwnedReadHalfTyped<T> {
                     }
                 }
                 let ret = Poll::Ready(Some(
-                    bincode_options()
+                    bincode_options(*size_limit)
                         .deserialize(current_item_buffer)
                         .map_err(Error::Bincode),
                 ));
@@ -276,9 +303,10 @@ impl<T: DeserializeOwned + Unpin> Stream for OwnedReadHalfTyped<T> {
 }
 
 impl<T> OwnedReadHalfTyped<T> {
-    fn new(raw: OwnedReadHalf) -> Self {
+    fn new(raw: OwnedReadHalf, size_limit: u64) -> Self {
         Self {
             raw,
+            size_limit,
             state: ReadHalfState::Idle,
             _phantom: PhantomData,
         }
@@ -299,6 +327,7 @@ enum LenReadMode {
 #[derive(Debug)]
 pub struct OwnedWriteHalfTyped<T> {
     raw: ManuallyDrop<OwnedWriteHalf>,
+    size_limit: u64,
     state: WriteHalfState,
     primed_values: VecDeque<T>,
 }
@@ -365,13 +394,16 @@ impl<T: Serialize + Unpin> OwnedWriteHalfTyped<T> {
     ) -> Poll<Result<Option<()>, Error>> {
         let Self {
             ref mut raw,
+            ref size_limit,
             ref mut state,
             ref mut primed_values,
         } = &mut *self;
         match state {
             WriteHalfState::Idle => {
                 if let Some(item) = primed_values.pop_back() {
-                    let to_send = bincode_options().serialize(&item).map_err(Error::Bincode)?;
+                    let to_send = bincode_options(*size_limit)
+                        .serialize(&item)
+                        .map_err(Error::Bincode)?;
                     let (new_current_len, to_be_sent) = if to_send.is_empty() {
                         ([ZST_MARKER, 0, 0, 0, 0, 0, 0, 0, 0], 1)
                     } else if to_send.len() < U16_MARKER as usize {
@@ -479,9 +511,10 @@ impl<T: Serialize + Unpin> OwnedWriteHalfTyped<T> {
 }
 
 impl<T> OwnedWriteHalfTyped<T> {
-    fn new(raw: OwnedWriteHalf) -> Self {
+    fn new(raw: OwnedWriteHalf, size_limit: u64) -> Self {
         Self {
             raw: ManuallyDrop::new(raw),
+            size_limit,
             state: WriteHalfState::Idle,
             primed_values: VecDeque::new(),
         }

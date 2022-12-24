@@ -145,19 +145,22 @@ async fn u32_len_messages() {
     }
 }
 
-// It takes a ridiculous amount of RAM to run the u64 tests
+// It takes a ridiculous amount of time to run the u64 tests
 #[ignore]
 #[tokio::test]
 async fn u64_len_message() {
     let socket_name = generate_socket_name().unwrap();
     let listener = LocalSocketListenerTyped::<Vec<u64>>::bind(socket_name.as_os_str()).unwrap();
-    let client_stream = tokio::spawn(LocalSocketStreamTyped::<Vec<u64>>::connect(socket_name));
-    let mut server_stream = Some(listener.accept().await.unwrap());
+    let client_stream = tokio::spawn(LocalSocketStreamTyped::<Vec<u64>>::connect_with_limit(
+        socket_name,
+        u64::MAX,
+    ));
+    let mut server_stream = Some(listener.accept_with_limit(u64::MAX).await.unwrap());
     let mut client_stream = client_stream.await.unwrap().unwrap();
     let message = (0..(u32::MAX as u64 + 1) / 8).collect::<Vec<_>>();
     let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
     assert_eq!(client_stream.next().await.unwrap().unwrap(), message);
-    fut.await.unwrap();
+    fut.await.unwrap().1.unwrap();
 }
 
 #[ignore]
@@ -165,8 +168,11 @@ async fn u64_len_message() {
 async fn u64_len_messages() {
     let socket_name = generate_socket_name().unwrap();
     let listener = LocalSocketListenerTyped::<Vec<u64>>::bind(socket_name.as_os_str()).unwrap();
-    let client_stream = tokio::spawn(LocalSocketStreamTyped::<Vec<u64>>::connect(socket_name));
-    let mut server_stream = Some(listener.accept().await.unwrap());
+    let client_stream = tokio::spawn(LocalSocketStreamTyped::<Vec<u64>>::connect_with_limit(
+        socket_name,
+        u64::MAX,
+    ));
+    let mut server_stream = Some(listener.accept_with_limit(u64::MAX).await.unwrap());
     let mut client_stream = client_stream.await.unwrap().unwrap();
     for _ in 0..10 {
         let message = (0..(u32::MAX as u64 + 1) / 8).collect::<Vec<_>>();
