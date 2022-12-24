@@ -51,7 +51,7 @@ been read, a new message can begin immediately afterward. This `length` value is
 message. Messages have no footer. The bytes read out of a message are then deserialized into a Rust type via
 [`bincode`](https://github.com/bincode-org/bincode), using the following configuration
 
-```rust
+```rust,ignore
 bincode::DefaultOptions::new()
     .with_limit(size_limit)
     .with_little_endian()
@@ -63,7 +63,7 @@ bincode::DefaultOptions::new()
 
 The length is encoded using a variably sized integer encoding scheme. To understand this scheme, first we need a few constant values.
 
-```
+```ignore
 u16_marker; decimal: 252, hex: FC
 u32_marker; decimal: 253, hex: FD
 u64_marker; decimal: 254, hex: FE
@@ -86,31 +86,31 @@ those being 4 bytes, and 8 bytes respectively.
 
 
 Length 12
-```
+```ignore
 0C
 ```
 
 Length 0
-```
+```ignore
 FF
 ```
 
 Length 252 (First byte is u16_marker)
-```
+```ignore
 FC, FC, 00
 ```
 
 Length 253 (First byte is u16_marker)
-```
+```ignore
 FC, FD, 00
 ```
 
 Length 65,536 (aka 2^16) (First byte is u32_marker)
-```
+```ignore
 FD, 00, 00, 01, 00
 ```
 
 Length 4,294,967,296 (aka 2^32) (First byte is u64_marker)
-```
+```ignore
 FE, 00, 00, 00, 00, 01, 00, 00, 00
 ```
