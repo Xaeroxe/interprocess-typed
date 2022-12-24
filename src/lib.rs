@@ -161,6 +161,12 @@ pub enum Error {
     /// Error from the `bincode` crate
     #[error("bincode serialization/deserialization error {0}")]
     Bincode(bincode::Error),
+    /// A message was sent that exceeded the configured length limit
+    #[error("message sent exceeded configured length limit")]
+    SentMessageTooLarge,
+    /// A message was received that exceeded the configured length limit
+    #[error("message received exceeded configured length limit, terminating connection")]
+    ReceivedMessageTooLarge,
 }
 
 fn bincode_options(size_limit: u64) -> impl Options {
@@ -287,6 +293,10 @@ impl<T: DeserializeOwned + Unpin> Stream for OwnedReadHalfTyped<T> {
                                 ) as u64,
                                 LenReadMode::U64 => u64::from_le_bytes(*len_in_progress),
                             };
+                            if new_len > *size_limit {
+                                *state = ReadHalfState::Finished;
+                                return Poll::Ready(Some(Err(Error::ReceivedMessageTooLarge)));
+                            }
                             *state = ReadHalfState::ReadingItem {
                                 len_read: 0,
                                 current_item_len: new_len as usize,
@@ -433,6 +443,9 @@ impl<T: Serialize + Unpin> OwnedWriteHalfTyped<T> {
                     let to_send = bincode_options(*size_limit)
                         .serialize(&item)
                         .map_err(Error::Bincode)?;
+                    if to_send.len() as u64 > *size_limit {
+                        return Poll::Ready(Err(Error::SentMessageTooLarge));
+                    }
                     let (new_current_len, to_be_sent) = if to_send.is_empty() {
                         ([ZST_MARKER, 0, 0, 0, 0, 0, 0, 0, 0], 1)
                     } else if to_send.len() < U16_MARKER as usize {
