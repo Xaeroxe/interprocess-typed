@@ -32,7 +32,6 @@ use futures::{
 };
 use interprocess::local_socket::{
     tokio::{LocalSocketListener, LocalSocketStream, OwnedReadHalf, OwnedWriteHalf},
-    ToLocalSocketName,
 };
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -43,6 +42,8 @@ const U16_MARKER: u8 = 252;
 const U32_MARKER: u8 = 253;
 const U64_MARKER: u8 = 254;
 const ZST_MARKER: u8 = 255;
+
+pub use interprocess::local_socket::ToLocalSocketName;
 
 /// Used by a server to accept new connections.
 #[derive(Debug)]
