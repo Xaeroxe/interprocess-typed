@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use futures::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt};
 use tokio::task::JoinHandle;
 
 use super::*;
 
-fn start_send_helper<T: Serialize + Unpin + Send + 'static>(
+fn start_send_helper<T: Serialize + DeserializeOwned + Unpin + Send + 'static>(
     mut s: LocalSocketStreamTyped<T>,
     value: T,
 ) -> JoinHandle<(LocalSocketStreamTyped<T>, Result<(), Error>)> {
@@ -50,8 +50,11 @@ async fn shutdown_after_hello_world() {
     let message = "Hello, world!".as_bytes().to_vec();
     let fut = start_send_helper(server_stream.take().unwrap(), message.clone());
     assert_eq!(client_stream.next().await.unwrap().unwrap(), message);
-    fut.await.unwrap().1.unwrap();
-    assert!(client_stream.next().await.is_none());
+    let (server_stream, result) = fut.await.unwrap();
+    result.unwrap();
+    mem::drop(server_stream);
+    let next = client_stream.next().await;
+    assert!(next.is_none(), "{next:?} was not none");
 }
 
 #[tokio::test]
