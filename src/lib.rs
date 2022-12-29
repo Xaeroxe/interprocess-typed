@@ -501,13 +501,11 @@ impl<T: Serialize + DeserializeOwned + Unpin> OwnedWriteHalfTyped<T> {
                                 Poll::Pending
                             }
                         }
+                    } else if closing {
+                        *state = WriteHalfState::Closing;
+                        continue;
                     } else {
-                        if closing {
-                            *state = WriteHalfState::Closing;
-                            continue;
-                        } else {
-                            Poll::Ready(Ok(Some(())))
-                        }
+                        Poll::Ready(Ok(Some(())))
                     }
                 }
                 WriteHalfState::WritingLen {
