@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::mem;
+
+use bincode::Options;
 use futures_util::{SinkExt, StreamExt};
 use tokio::task::JoinHandle;
 
@@ -162,9 +165,20 @@ async fn u32_len_messages() {
     }
 }
 
+// Copy paste of the options from async-io-typed.
+fn bincode_options(size_limit: u64) -> impl Options {
+    // Two of these are defaults, so you might say this is over specified. I say it's future proof, as
+    // bincode default changes won't introduce accidental breaking changes.
+    bincode::DefaultOptions::new()
+        .with_limit(size_limit)
+        .with_little_endian()
+        .with_varint_encoding()
+        .reject_trailing_bytes()
+}
+
 #[tokio::test]
 async fn u16_marker_len_message() {
-    let bincode_config = super::bincode_options(1024);
+    let bincode_config = bincode_options(1024);
 
     let socket_name = generate_socket_name().unwrap();
     let listener = LocalSocketListenerTyped::<Vec<u16>>::bind(socket_name.as_os_str()).unwrap();
@@ -180,7 +194,7 @@ async fn u16_marker_len_message() {
 
 #[tokio::test]
 async fn u32_marker_len_message() {
-    let bincode_config = super::bincode_options(1024);
+    let bincode_config = bincode_options(1024);
     let socket_name = generate_socket_name().unwrap();
     let listener = LocalSocketListenerTyped::<Vec<u16>>::bind(socket_name.as_os_str()).unwrap();
     let client_stream = tokio::spawn(LocalSocketStreamTyped::<Vec<u16>>::connect(socket_name));
@@ -195,7 +209,7 @@ async fn u32_marker_len_message() {
 
 #[tokio::test]
 async fn u64_marker_len_message() {
-    let bincode_config = super::bincode_options(1024);
+    let bincode_config = bincode_options(1024);
     let socket_name = generate_socket_name().unwrap();
     let listener = LocalSocketListenerTyped::<Vec<u8>>::bind(socket_name.as_os_str()).unwrap();
     let client_stream = tokio::spawn(LocalSocketStreamTyped::<Vec<u8>>::connect(socket_name));
@@ -210,7 +224,7 @@ async fn u64_marker_len_message() {
 
 #[tokio::test]
 async fn zst_marker_len_message() {
-    let bincode_config = super::bincode_options(1024);
+    let bincode_config = bincode_options(1024);
     let socket_name = generate_socket_name().unwrap();
     let listener = LocalSocketListenerTyped::<Vec<u8>>::bind(socket_name.as_os_str()).unwrap();
     let client_stream = tokio::spawn(LocalSocketStreamTyped::<Vec<u8>>::connect(socket_name));
